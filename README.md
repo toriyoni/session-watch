@@ -1,356 +1,234 @@
-# UCAS Course Sign-in
+# Session Watch
 
-A small command-line tool for **searching UCAS courses, signing in directly, or
-showing a scannable sign-in QR code**.
+A terminal client for course sessions, QR codes, and periodic sign-in attempts.
+It keeps the interactive session usable after rejected requests and provides an
+optional polling mode with automatic reauthentication.
 
-It runs entirely in the terminal with plain prompts — no full-screen UI, no
-browser. You answer a few questions (mail, password) and then pick a course by
-number; the tool can either call the upstream sign-in endpoint for you or
-render a QR code that you scan with the UCAS mobile app.
+## Attribution and license
 
-> This is a Python rewrite of [lccipher/UCAS-Course-Sign-in](https://github.com/lccipher/UCAS-Course-Sign-in).
+This project is a modified version of
+[KINGFIOX/ucas-course-sign-in](https://github.com/KINGFIOX/ucas-course-sign-in),
+based on upstream commit
+[`9416eb7`](https://github.com/KINGFIOX/ucas-course-sign-in/commit/9416eb7ad4e2b3c3955c3757196c5b05775a229e).
+The upstream Python implementation was itself based on
+[lccipher/UCAS-Course-Sign-in](https://github.com/lccipher/UCAS-Course-Sign-in).
+Credit for the original implementation and protocol work belongs to those
+projects and their contributors.
 
->[!CAUTION]
-> **This project is for learning and personal use only. Do not use it for any commercial or illegal purpose.**
+Modifications in this version, dated **2026-09-29**, include:
 
-## Features
+- Recoverable sign-in failures that return to the selection prompt.
+- Automatic polling in configurable ten-minute increments.
+- Environment-based credentials and automatic reauthentication.
+- Optional notifications that do not interrupt polling when delivery fails.
+- A macOS launcher that prevents idle sleep while the client is running.
+- Regression tests covering recovery, polling, date rollover, and response parsing.
 
-- **Prompt-based login**: you are asked for your mail and password once, in
-  the spirit of FreeBSD's `adduser`. The password is read without echo.
-- **No date to enter**: the date is always *today*, taken from the calibrated
-  UCAS server clock.
-- **Course list**: today's schedule is fetched automatically and shown in a table.
-- **Direct sign-in**: pick a course by its number and the tool signs in for it.
-- **Sign-in QR code**: `qr <number>` renders a scannable QR code in the terminal
-  and prints a fresh one every 5 seconds, so the embedded timestamp stays valid.
-- **Sign-in window hints**: `Open` / `Not open` / `Closed` is shown for every course.
-- **Server clock calibration**: syncs with the UCAS timestamp server and
-  compensates for the ~3s drift between its two servers.
-- Refreshes the course status automatically after a successful sign-in.
-- **Automatic sign-in**: a class-calendar scheduler (`server`) that signs in for
-  you at every class-period start and pushes the result to your phone. It is
-  meant to run in the shipped
-  `Dockerfile` / `docker-compose.yml` stack (see
-  [Automatic sign-in](#automatic-sign-in-docker)).
-
-All UCAS requests go straight to `iclass.ucas.edu.cn:8181`, and credentials are
-only held in memory for the current session — never written to disk(which is 
-safe for your privacy). When
-notifications are enabled, only the sign-in *result* (course names and status,
-no credentials) is sent to your Feishu group, which may be a third-party
-server.
+The original Git history and [AGPL-3.0 license](LICENSE) are retained. This is an
+independent derivative, not an official service or an endorsement by the
+upstream authors or the institution operating the service.
 
 ## Requirements
 
-- Python **3.10+**
-- [uv](https://docs.astral.sh/uv/) (or `pipx`) for installation
+- Python 3.10 or newer.
+- [uv](https://docs.astral.sh/uv/).
+- macOS or Linux for the terminal interface, which uses POSIX terminal APIs.
 
-## Install & run
+The macOS launcher additionally uses the system-provided `caffeinate` command.
 
-### Run from a clone (uv native, recommended)
-
-`uv` reads `pyproject.toml` and `uv.lock`, creates `.venv` on demand and runs
-the project's console scripts inside it — no manual `venv` activation and no
-separate install step:
+## Quick start
 
 ```bash
-uv sync                  # create .venv and install the project (editable)
-uv run tui               # interactive course list / sign-in
-uv run server            # auto sign-in scheduler (runs at every class-period start)
+git clone https://github.com/xiaoxiaojiujiu/session-watch.git
+cd session-watch
+uv sync --frozen --python 3.12
+uv run --frozen tui
 ```
 
-Pass a specific interpreter on the first sync if you like:
-`uv sync --python=3.12`.
+Enter your email address and password when prompted. Password input is hidden.
+After login, the client displays today's courses and accepts the following
+commands:
 
-## Usage
-
-Start the program and answer the prompts:
-
-```text
-UCAS Course Sign-in
-===================
-Mail: you@mails.ucas.ac.cn
-Password:
-Signing in... done.
-Fetching courses for 2026-03-25... done.
-
-  #  Course              Teacher  Time           Status      Sign-in window
-  -  ------------------  -------  -------------  ----------  --------------
-  1  分布式系统          张三     10:25 ~ 11:15  Not signed  Open
-  2  机器学习与数据挖掘  李四     13:30 ~ 15:20  Signed      Not open
-
-Enter a course number to sign in, or one of:
-  <number>     sign in for the course with that number
-  qr <number>  show a scannable sign-in QR code for that course
-  r            reload today's courses
-  ?            show this help
-  q            quit
-
-Select: 1
-Signing in for '分布式系统'... done.
-  ✓ Sign-in successful (sign-in record 123456)
-```
-
-After a successful sign-in for a listed course, the schedule is reloaded so the
-status column stays current.
-
-### Commands
-
-| Input | Action |
+| Command | Action |
 | --- | --- |
-| `<number>` | Sign in for the course with that number |
-| `qr <number>` | Show a scannable sign-in QR code for that course |
-| `r` | Reload today's courses |
-| `?` | Show the command help |
-| `q` | Quit |
+| `<number>` | Attempt sign-in for the selected course |
+| `qr <number>` | Display a QR code for the selected course |
+| `r` | Refresh today's course list |
+| `auto` | Begin polling at the configured interval, defaulting to 10 minutes |
+| `auto 20` | Begin polling every 20 minutes |
+| `?` | Display help |
+| `q` | Exit |
 
-### QR code
+A rejected sign-in prints its reason and returns to `Select:`. Credentials stay
+available for the current process, so a failed attempt does not require you to
+start over. A successful attempt refreshes the course list.
 
-`qr <number>` prints the upstream sign-in URL as a QR code, exactly like the
-web version: it encodes `stu_scan_sign.action` with the course ID and a
-calibrated timestamp (no user id). Because the URL embeds a timestamp, a stale
-code is rejected by the upstream, so a **fresh code is printed every 5 seconds**
-and simply scrolls down; the newest one is the one to scan.
+In QR mode, a fresh code is printed every five seconds. Press `b` to return to
+the course list. Displaying a QR code does not itself complete sign-in.
 
-- press **`b`** to go back to the course list.
+## Automatic mode
 
-Showing a QR code does **not** sign in by itself: you scan it with the UCAS app
-and confirm there.
-
-## Automatic sign-in (Docker)
-
-Besides the interactive TUI, the project ships a non-interactive scheduler
-(`server`) that is meant to run in the deployed Docker stack. It signs in for
-you **at every class-period start of the UCAS academic calendar** (08:25,
-09:15, 10:20, 11:10, 13:25, 14:15, 15:20, 16:10, 17:00, 18:25, 19:15, 20:10,
-21:00 Beijing time, hardcoded in `src/server/server.py`) and only notifies you
-when there is something to say.
-
-What each run does:
-
-| Situation | Action | Log level |
-| --- | --- | --- |
-| No courses today | silent | INFO |
-| A course is already signed in (upstream) | silent | INFO |
-| Courses today, but none is in its sign-in window | silent | INFO |
-| A course is in its sign-in window and not yet signed, sign in succeeds | push | WARNING |
-| A course is in its sign-in window and not yet signed, sign in fails | push | CRITICAL |
-| UCAS rejects the sign-in (e.g. `ERRCODE 101` 二维码已失效) | retried once, then push | CRITICAL |
-| Today's date or the course list cannot be fetched | push | CRITICAL |
-| The upstream answers with a shape nobody implemented (server crashes on purpose) | push + exit | CRITICAL |
-| Configuration error (server exits) | log only | CRITICAL |
-| Notification configuration error (server exits) | log only | CRITICAL |
-
-"In its sign-in window" means from 30 minutes before the class starts until the
-class ends -- the same window the upstream enforces. A pass runs at each
-class-period start, which always lands inside the window of a class beginning
-then; when a class spans several periods, later passes are retries.
-
-Each run is idempotent per day: every pass re-fetches today's course list and
-trusts the sign-in flag **UCAS itself returns**, so a course that is already
-signed in is never signed or pushed twice.
-Failures would not stop the server, but will notify you via Feishu,
-which would be retried on the next class-period run.
-
-### Quick start with Feishu
-
-Feishu / Lark (飞书) works with a **personal account**: create a group, open
-`Settings -> Group bots -> Add bot -> Custom bot`, pick a security mode and copy
-the webhook. Keep the group to yourself only if you don't want anyone else to
-receive the notifications.
-
-1. Choose a security mode:
-   - **Signature verification**: copy the secret and set `UCAS_FEISHU_SECRET`.
-2. Copy the webhook (`https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`).
-3. Put it in `.env`:
+Start directly in automatic mode:
 
 ```bash
-UCAS_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx
-UCAS_FEISHU_SECRET=xxxxxxxxxxxxxxxx   # only for "signature verification"
+uv run --frozen tui --auto
 ```
 
-Then `docker compose up -d --build` and watch the runs with
-`docker compose logs -f`.
-
-### Deploy with docker compose
+Provide credentials once. The client immediately checks today's courses, then
+waits ten minutes after each completed pass before checking again. To change
+the interval:
 
 ```bash
-cp .env.example .env
-$EDITOR .env                 # credentials + Feishu webhook
+uv run --frozen tui --auto --interval-minutes 20
+```
 
+Intervals must be positive multiples of ten minutes. Every course query and
+sign-in request authenticates again with the captured credentials. Each pass
+fetches the current date and course list; after midnight, it uses the new date.
+Courses already marked as signed by the upstream service are skipped.
+
+When automatic mode was entered through the `Select:` prompt, `Ctrl+C` returns
+to that prompt. When started with `--auto`, `Ctrl+C` stops the program.
+
+### macOS launcher
+
+Double-click `start-auto.command` in Finder, or run:
+
+```bash
+./start-auto.command
+```
+
+The launcher loads `.env` when present, asks for any missing credentials, and
+starts automatic mode. It uses `caffeinate -i` to prevent idle system sleep while
+the process runs; the display can still sleep. Keep the terminal process alive
+and the computer connected. Closing the lid, manually putting the computer to
+sleep, shutting it down, or terminating the process prevents further polling.
+
+### Saved configuration
+
+Prompted credentials remain in memory and are not saved automatically. To reuse
+credentials on later launches, create a local `.env` file:
+
+```dotenv
+UCAS_USERNAME=your-account@example.com
+UCAS_PASSWORD='your-password'
+UCAS_POLL_MINUTES=10
+UCAS_RUN_ON_START=1
+UCAS_FEISHU_WEBHOOK=
+```
+
+Use the actual email address accepted by the upstream service. Set file
+permissions with `chmod 600 .env`. The file is ignored by Git. Use single quotes
+around values containing characters such as `$` or `#`, and let uv load the file
+instead of sourcing it as a shell script.
+
+```bash
+uv run --frozen --env-file .env tui --auto
+```
+
+`--interval-minutes` overrides `UCAS_POLL_MINUTES`. TUI automatic mode always
+performs an initial check; only `server` honors `UCAS_RUN_ON_START`.
+
+## Non-interactive server
+
+For credentials supplied through environment variables or `.env`:
+
+```bash
+uv run --frozen --env-file .env server
+```
+
+The server runs the same polling logic without interactive prompts. Missing
+credentials or an invalid interval cause a configuration error. `SIGTERM` and
+`SIGINT` stop it gracefully.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UCAS_USERNAME` | unset | Account email; required by `server`, prompted by TUI if absent |
+| `UCAS_PASSWORD` | unset | Account password; required by `server`, prompted by TUI if absent |
+| `UCAS_POLL_MINUTES` | `10` | Positive multiple of ten minutes |
+| `UCAS_RUN_ON_START` | `1` | Run immediately when `server` starts |
+| `UCAS_FEISHU_WEBHOOK` | unset | Optional notification webhook for `server` |
+| `UCAS_FEISHU_SECRET` | unset | Optional webhook signature secret |
+
+### Docker Compose
+
+If `.env` does not already exist, copy `.env.example` and fill in the credentials.
+Then run:
+
+```bash
 docker compose up -d --build
-docker compose logs -f        # watch the runs
+docker compose logs -f
 ```
 
-Useful commands:
+Use `docker compose down` to stop. The container runs the polling server;
+`UCAS_RUN_ON_START=0` delays the first pass by one interval.
 
-```bash
-docker compose ps
-docker compose restart
-docker compose down
+### Optional notifications
 
-docker compose logs
-```
+Set `UCAS_FEISHU_WEBHOOK` to a Feishu custom-bot webhook to enable server
+notifications. If the bot uses signature verification, also set
+`UCAS_FEISHU_SECRET`. Leave the webhook empty for local logs only. TUI automatic
+mode does not send notifications.
 
-There is no separate one-shot command: the container always runs the
-class-calendar scheduler, and with `UCAS_RUN_ON_START=1` (the default) it also
-performs one pass immediately on start.
+The server reports successful sign-ins and failures through the configured bot.
+Routine waiting, no courses, and already-signed courses produce local logs only.
+Delivery failures are printed locally without stopping polling. Failed
+notifications are not queued for later delivery. Notification payloads contain
+course names and outcomes, not account credentials.
 
-The server logs through the Python standard `logging` module to stderr, one line
-per event, timestamped in `Asia/Shanghai`: `docker compose logs -f` is all you
-need to follow it. Notifications are log-driven too (see below).
+## Recovery and timing
 
-### Notifications (Feishu)
+| Situation | Behavior |
+| --- | --- |
+| Sign-in is rejected | Show or log the reason; keep the session running |
+| Network, timestamp, authentication, or schedule API error | Retry on the next automatic refresh |
+| No courses, already signed, or outside the estimated window | Wait for the next refresh |
+| A course has an unsupported time or an API failure | Record that failure and continue with other courses |
+| Notification delivery fails | Print a local error and continue polling |
+| A response explicitly confirms success | Report success; use the next course list to decide whether to skip it |
 
-Feishu / Lark (飞书) is the only notification provider. The bot posts a `text`
-message to the group that owns the webhook, so keep that group to yourself only
-if the messages should stay private.
+Automatic mode uses an estimated window from thirty minutes before class until
+class ends, based on the calibrated upstream clock in `Asia/Shanghai`. The
+upstream service may still reject an attempt within that window. Such a
+rejection is retried on the next pass; polling does not override the upstream
+service's acceptance rules. A window shorter than the polling interval can be
+missed, and success is not guaranteed.
 
-Notifications are **log-driven**: a `logging` handler pushes every record at
-`WARNING` or above from the server's own loggers. So a successful run (logged at
-`INFO`) stays silent, while a sign-in failure or a failed fetch (`CRITICAL`) is
-pushed once. Add `extra={"title": ...}` to a log call to control
-the message title. Library noise (`httpx`, ...) and anything below `WARNING` are
-never pushed.
+Expected API errors are handled at the command or polling-pass boundary.
+Unsupported response shapes remain visible in logs. Unexpected programming
+errors are not caught indiscriminately.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `UCAS_FEISHU_WEBHOOK` | -- | Full custom-bot webhook URL (**required**) |
-| `UCAS_FEISHU_SECRET` | -- | Secret for the "signature" (签名校验) security mode |
+## Implementation notes
 
-The webhook already contains the bot token. With the "signature" mode, set
-`UCAS_FEISHU_SECRET`; `timestamp` and `sign` are added to the JSON body.
-Messages are sent as Feishu `text`.
-If `UCAS_FEISHU_WEBHOOK` is missing, the server exits with a configuration error
-instead of silently dropping notifications; a failed push is likewise never
-swallowed -- if the webhook stops working, the process crashes on purpose
-instead of letting sign-in results vanish silently.
+Requests are sent directly to the upstream endpoints on
+`iclass.ucas.edu.cn:8181`. Compatibility with the inherited API, environment
+variable names, and Python package name is preserved.
 
-### Error handling
-
-Every deliberate error derives from `UcasError` (`src/common/error.py`), and the
-class hierarchy encodes what may happen to it:
-
-* `UcasOperationalError` -- bad input (`UcasTimeError`, `UcasUnrecognizableCourse`),
-  rejected credentials (`UcasAuthError`), network trouble (`UcasNetworkError`) and
-  upstream trouble (`UcasServerError`, `UcasJsonError`). These never crash the
-  server: each pass catches them, logs at `CRITICAL` (which pushes) and carries on;
-  the next class-period run retries. A known case is `ERRCODE 101`
-  "二维码已失效！": direct sign-in shares the QR code's endpoint and embedded
-  timestamp, so UCAS rejects it with QR-flavoured wording whenever the sign-in
-  code is not currently accepted -- a transient condition (production logs show
-  the same request succeeding ~30s later), so it is retried once in-pass.
-* `UcasNotImplementedError` derives from `UcasError` only. It marks an upstream
-  response shape nobody has written handling for, and crashing the process is the
-  intended behaviour: nobody catches it, the fatal log pushes one last message,
-  and the traceback lands in `docker compose logs` so the missing path gets noticed
-  and implemented.
-
-So `except UcasOperationalError` is always safe, while `except UcasError` would
-swallow the deliberate crashes.
-
-### Auto-sign environment variables
-
-Notification settings are listed under [Notifications (Feishu)](#notifications-feishu);
-the remaining variables are:
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `UCAS_USERNAME` | -- | UCAS mail (required) |
-| `UCAS_PASSWORD` | -- | Password (from `.env`) |
-| `UCAS_RUN_ON_START` | `1` | Run a pass immediately on server start |
-
-The schedule endpoint reports three states in its `STATUS` field, and the server
-now tells them apart: `0` = ok, `1` = a real error (surfaced and pushed), `2` =
-no courses that day (quiet).
-
-### How the schedule works
-
-The server wakes at every class-period start (`08:25`, `09:15`, ... Beijing
-time, hardcoded from the academic calendar) and runs a sign-in pass.
-No cron or extra scheduler dependency is involved. Shutdown is a regular
-server-style `KeyboardInterrupt`: `SIGTERM`/`SIGINT` (as sent by `docker stop`)
-are routed to it, so both interrupt the sleep and exit gracefully.
-
-## How it works
+The shared client performs login, fetches the daily schedule, calibrates the
+clock, and submits sign-in requests or builds QR payloads. The inherited
+three-second timestamp buffer compensates for the upstream endpoints' clock
+difference. Co-taught rows with the same course number and times are merged into
+one displayed session.
 
 ```text
-CLI
- ├─ POST login.action                     → get sessionId / userId
- ├─ GET  get_stu_course_sched.action      → course list for the day
- ├─ POST get_timestamp.do                 → calibrate the server clock offset
- └─ GET  stu_scan_sign.action             → direct sign-in (or QR payload)
-        courseSchedId=<7-digit course ID> or timeTableId=<UUID>&timestamp=<calibrated>&id=<userId>
+src/common/        Shared API client, data models, and typed errors
+src/tui/           Interactive selection, QR codes, and automatic-mode entry
+src/server/        Polling, per-pass sign-in, logging, and optional notifications
+tests/             Offline regression tests with simulated upstream responses
+start-auto.command macOS launcher
 ```
 
-Details preserved from the original port:
-
-- **Timestamp buffer**: `get_timestamp.do` and `stu_scan_sign.action` run on
-  different servers whose clocks drift by ~3 seconds, so the sign-in timestamp
-  is the calibrated server time minus 3 seconds.
-- **Sign-in window**: from 30 minutes before class until the class ends. The tool
-  shows the window state but does not block sign-in — the upstream response is
-  the source of truth.
-- The web app's server-side protections (same-origin check, rate limiting) were
-  **removed**, because requests originate from the local machine and no public
-  service is exposed.
-
-One quirk added on top: **co-taught courses (合班课) are merged into one course**.
-The schedule endpoint returns one row per teacher -- same course number, time
-and classroom, different `courseId`/schedule id (e.g. 高级操作系统教程 taught by
-李鹏/郑晨/武延军 comes back as three rows). It is one physical session and one
-sign-in: signing any row marks them all signed, and further rows only draw
-`ERRCODE 101`. `query_courses` therefore collapses rows sharing course number
-and time, keeping the first row's id for signing and joining the teacher names.
-
-## Project layout
-
-```text
-.
-├─ pyproject.toml
-├─ Dockerfile                 # deployable image (class-calendar server by default)
-├─ docker-compose.yml         # server deployment
-├─ .env.example               # copy to .env and fill in
-├─ src/
-│  ├─ common/                 # shared logic, used by both front ends
-│  │  ├─ __init__.py          #   version
-│  │  ├─ api.py               #   upstream client + pure logic (login / schedule / sign-in / clock)
-│  │  └─ error.py             #   UcasError hierarchy
-│  ├─ tui/                    # interactive front end
-│  │  ├─ __main__.py          #   python -m tui
-│  │  └─ tui.py               #   prompt flow and QR code
-│  └─ server/                 # automatic front end
-│     ├─ __main__.py          #   python -m server
-│     ├─ autosign.py          #   one-pass sign-in + notification
-│     ├─ server.py            #   class-calendar scheduler
-│     ├─ logging.py           #   stdlib logging + notify handler (stderr/Push)
-│     └─ notify.py            #   Feishu notifications
-```
-
-## Development
+## Development and validation
 
 ```bash
-uv venv --python=3.12
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-
-# Run the TUI locally
-tui
-
-# Lint
-ruff check .
+uv sync --frozen --extra dev
+uv run --frozen --extra dev pytest -q
+uv run --frozen --extra dev ruff check src tests
 ```
 
-`UcasClient` accepts an injected `httpx.Client`, which makes it easy to point
-at a different upstream or to inject a `MockTransport` in tests. `tui.tui.main()`
-accepts an injected `client=...` for the same reason.
-
-## Disclaimer
-
-- This project is for learning and personal use only. Do not use it commercially or illegally.
-- You are solely responsible for any consequences of using this project.
-- The upstream API may change at any time; if it stops working, open an issue or adapt it yourself.
-
-## License
-
-[AGPL-3.0](./LICENSE) (same as the original project)
+The tests exercise rejection recovery, continued selection without another
+credential prompt, automatic retries, polling intervals, window transitions,
+date rollover, reauthentication, skipping signed courses, and notification
+failures. They use mocks and HTTP transports without calling the live service.
+Passing them does not establish live-service availability or successful sign-in
+for a real account.

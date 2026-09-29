@@ -26,6 +26,8 @@ htmlcov/
 
 # Automatic sign-in
 .env
+.env.*
+!.env.example
 data/
 ucas-course-sign-in-state.json
 ucas-course-sign-in-state.json.tmp

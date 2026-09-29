@@ -1,34 +1,9 @@
-"""Non-interactive, one-shot automatic sign-in.
+"""One automatic sign-in pass, shared by the TUI and polling server.
 
-This is the piece that makes the tool usable as a scheduled job: it logs in,
-loads *today's* courses, signs in for every course whose sign-in window is
-currently open, and reports the outcome.
-
-Error contract (see :mod:`common.error`):
-
-* :class:`~common.error.UcasOperationalError` -- bad credentials, network and
-  upstream trouble -- never escapes :func:`run_once`. It is logged at
-  ``CRITICAL`` (``logger.fatal``), which the notify handler turns into a push,
-  and the server keeps running.
-* :class:`UcasNotImplementedError` is deliberately **not** caught: it escapes
-  ``run_once``, crashes the process and takes the fatal log (and thus one last
-  notification) with it. An unimplemented path must be loud.
-* Notifier failures are not caught either: if a push cannot be delivered the
-  operator must notice, so the process is allowed to die.
-
-Notifications are not sent from here directly: the module only logs, and
-:mod:`server.logging` turns every ``WARNING`` or worse into a push.
-
-The run is *idempotent per day*: the course list is re-fetched from UCAS on
-every run and a course that is already marked as signed upstream is never
-signed again or pushed twice. Failures are retried on the next run, and a
-later class period usually still falls inside the window, leaving a chance
-to recover.
-
-This module is an internal building block: the ``server`` console script calls
-:func:`run_once` at every class-period start (see :mod:`server.server`). A
-standalone one-shot command is intentionally not exposed; the Docker image
-runs the server.
+Each pass refreshes today's courses and reauthenticates using captured
+credentials. Already-signed courses and courses outside the estimated window
+are skipped. API errors are recorded and retried on the next polling pass;
+one malformed course does not prevent attempts for other courses.
 """
 
 from __future__ import annotations
@@ -44,7 +19,7 @@ from common.api import (
     format_date_from_ms,
     sign_window_state,
 )
-from common.error import UcasOperationalError
+from common.error import UcasError
 
 from .logging import get_logger
 
@@ -53,6 +28,17 @@ logger = get_logger(__name__)
 
 class AutosignConfigError(Exception):
     """Raised when the runner is not configured correctly."""
+
+
+def parse_poll_minutes(raw: str) -> int:
+    """Polling is configured in positive ten-minute units."""
+    try:
+        minutes = int(raw)
+    except ValueError:
+        raise AutosignConfigError("poll interval must be 10, 20, 30, ... minutes") from None
+    if minutes <= 0 or minutes % 10:
+        raise AutosignConfigError("poll interval must be 10, 20, 30, ... minutes")
+    return minutes
 
 
 def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
@@ -70,8 +56,9 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
 @dataclass
 class AutosignConfig:
     username: str
-    password: str
+    password: str = field(repr=False)
     run_on_start: bool = True
+    poll_minutes: int = 10
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutosignConfig":
@@ -82,7 +69,7 @@ class AutosignConfig:
         """
         env = env if env is not None else os.environ
         username = (env.get("UCAS_USERNAME") or "").strip()
-        password = (env.get("UCAS_PASSWORD") or "").strip()
+        password = env.get("UCAS_PASSWORD") or ""
 
         if not username:
             raise AutosignConfigError("UCAS_USERNAME is required for automatic sign-in")
@@ -93,6 +80,7 @@ class AutosignConfig:
             username=username,
             password=password,
             run_on_start=_env_bool(env, "UCAS_RUN_ON_START", True),
+            poll_minutes=parse_poll_minutes(env.get("UCAS_POLL_MINUTES") or "10"),
         )
 
 
@@ -148,19 +136,14 @@ class AutosignResult:
 def run_once(client: UcasClient, config: AutosignConfig) -> AutosignResult:
     """Fetch today's courses and sign in for everything actionable.
 
-    Never raises :class:`~common.error.UcasOperationalError`: those are caught,
-    logged at ``CRITICAL`` (and therefore pushed) and turned into an
-    :class:`AutosignResult`. :class:`UcasNotImplementedError` and genuine bugs
-    do escape, on purpose -- see the module docstring.
+    API errors become an AutosignResult. Programming errors still propagate.
     """
-    # 1. Which day are we signing for, and what courses are there? The
-    #    calibrated UCAS server clock decides. All errors here are operational
-    #    and abort the whole run; UcasNotImplementedError escapes and crashes.
+    # Use the calibrated UCAS clock to choose the date, including after midnight.
     try:
         now_ms = client.server_now_ms()
         date = format_date_from_ms(now_ms)
         courses = client.query_courses(config.username, config.password, date)
-    except UcasOperationalError as exc:
+    except UcasError as exc:
         logger.fatal(
             "could not load the schedule for today: %s",
             exc.describe(),
@@ -176,23 +159,27 @@ def run_once(client: UcasClient, config: AutosignConfig) -> AutosignResult:
     #    of truth: a course already signed in (`signStatus == "1"`) is skipped,
     #    and a course is only signed inside its sign-in window.
     pending: list[Course] = []
+    result = AutosignResult(date=date, status="idle")
     for course in courses:
         if course.signed:
             continue
-        window = sign_window_state(course, date, now_ms)
+        try:
+            window = sign_window_state(course, date, now_ms)
+        except UcasError as exc:
+            result.failed.append(SignDetail(course=course, error=exc.describe()))
+            continue
         if window != "open":
             logger.info("%s: skip %s (window: %s)", date, course.course_name or course.id, window)
             continue
         pending.append(course)
 
-    if not pending:
+    if not pending and not result.failed:
         logger.info("%s: %d course(s), nothing to sign in -- staying silent", date, len(courses))
         return AutosignResult(date=date, status="idle")
 
     # 3. Sign in. Each course is logged at INFO; the run as a whole is rolled up
     #    into one WARNING (success) / CRITICAL (failure) below, so the notify
     #    handler pushes at most one message per outcome instead of per course.
-    result = AutosignResult(date=date, status="signed")
     for course in pending:
         outcome = _sign_one(client, config, course)
         if outcome.ok:
@@ -208,6 +195,7 @@ def run_once(client: UcasClient, config: AutosignConfig) -> AutosignResult:
             )
 
     if result.signed:
+        result.status = "signed"
         title, body = _success_message(date, result.signed)
         logger.warning(body, extra={"title": title})
 
@@ -220,15 +208,11 @@ def run_once(client: UcasClient, config: AutosignConfig) -> AutosignResult:
 
 
 def _sign_one(client: UcasClient, config: AutosignConfig, course: Course) -> SignDetail:
-    """Sign in for one course, turning every operational failure into a reason.
-
-    :class:`UcasNotImplementedError` deliberately escapes -- see the module
-    docstring.
-    """
+    """Convert an API failure for one course into a reportable result."""
     identifier = course.id or course.uuid
     try:
         sign_result = client.sign(config.username, config.password, identifier)
-    except UcasOperationalError as exc:
+    except UcasError as exc:
         return SignDetail(course=course, error=exc.describe())
     return SignDetail(course=course, result=sign_result)
 
@@ -260,7 +244,7 @@ def _failure_message(date: str, failed: list[SignDetail]) -> tuple[str, str]:
     lines = [
         f"Date: {_pretty_date(date)}",
         "",
-        "The following courses could not be signed in -- please handle them manually:",
+        "The following courses could not be signed in; retrying on the next refresh:",
         "",
         *(_format_course_line(item) for item in failed),
     ]

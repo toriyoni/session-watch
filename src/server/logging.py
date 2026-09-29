@@ -17,11 +17,12 @@ the container itself is on.
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime
 
 from common.api import UCAS_TIMEZONE
 
-from .notify import Message, Notifier
+from .notify import Message, Notifier, NotifyError
 
 #: ``2026-03-25 10:25:00 INFO     server.autosign: ...``
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
@@ -51,10 +52,8 @@ class NotifyHandler(logging.Handler):
     ``extra={"title": ...}`` to control the title; otherwise
     ``"{prefix}: {levelname}"`` is used.
 
-    Errors raised by the notifier are deliberately **not** caught: they
-    propagate to the ``logger.*`` call site and crash the process. A sign-in
-    result that cannot be delivered is worthless, and silently swallowing the
-    failure would hide exactly that, so dying loudly is the intended behaviour.
+    Notification errors are printed locally without exposing the webhook.
+    A notification outage must not interrupt automatic sign-in.
     """
 
     def __init__(
@@ -69,7 +68,15 @@ class NotifyHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         title = getattr(record, "title", "") or f"{self.prefix}: {record.levelname.lower()}"
-        self.notifier.send(Message(title=title, body=record.getMessage()))
+        try:
+            self.notifier.send(Message(title=title, body=record.getMessage()))
+        except (NotifyError, ValueError) as exc:
+            # Avoid logging through this handler recursively, and do not expose
+            # a webhook URL from an HTTP exception. Polling must keep running.
+            print(
+                f"Feishu notification failed ({type(exc).__name__}); auto sign-in will continue.",
+                file=sys.stderr,
+            )
 
 
 def configure_logging(level: int | str = logging.INFO) -> None:

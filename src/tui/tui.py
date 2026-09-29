@@ -13,14 +13,14 @@ command loop over today's courses:
 The date is never asked for: it is taken from the calibrated UCAS server clock,
 so it is always "today" as the upstream understands it.
 
-Error contract (see :mod:`common.error`): operational errors are caught,
-explained to the user and retried or ignored; :class:`UcasNotImplementedError`
-is never caught -- it crashes with a traceback so the unimplemented path is
-obvious.
+API errors are reported at the command boundary without discarding credentials.
+Automatic mode retries on the next polling pass and returns to the selection
+menu when interrupted.
 """
 
 from __future__ import annotations
 
+import argparse
 import getpass
 import os
 import select
@@ -29,7 +29,7 @@ import termios
 import time
 import tty
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import qrcode
 
@@ -50,10 +50,12 @@ from common.error import (
     UcasError,
     UcasJsonError,
     UcasNetworkError,
-    UcasOperationalError,
     UcasServerError,
     UcasUnrecognizableCourse,
 )
+from server.autosign import AutosignConfig, AutosignConfigError, parse_poll_minutes
+from server.logging import configure_logging
+from server.server import Server
 
 WINDOW_TEXT = {
     "open": "Open",
@@ -65,20 +67,10 @@ HELP_LINES = (
     "  <number>     sign in for the course with that number",
     "  qr <number>  show a scannable sign-in QR code for that course",
     "  r            reload today's courses",
+    "  auto [10]    auto sign-in every 10, 20, 30, ... minutes; Ctrl+C to return",
     "  ?            show this help",
     "  q            quit",
 )
-
-USAGE = """\
-usage: tui
-
-Sign in for UCAS courses from the terminal. Prompts for your mail and
-password, lists today's courses, and signs in on request.
-
-options:
-  -h, --help     show this help and exit
-  -V, --version  show the version and exit
-"""
 
 
 class _Quit(Exception):
@@ -90,7 +82,7 @@ class Session:
     """Credentials captured at login and reused for the whole session."""
 
     username: str
-    password: str
+    password: str = field(repr=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -157,33 +149,40 @@ def _error_hint(exc: UcasError) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _login(client: UcasClient) -> Session:
-    """Prompt for the mail and password until the upstream accepts them.
-
-    The mail is always entered interactively; neither a command-line argument
-    nor an environment variable pre-fills it. Rejected credentials go back to
-    the prompts; a network or upstream hiccup is retried with the same ones.
-    """
-    while True:
+def _read_session(*, from_env: bool = True) -> Session:
+    """Use configured credentials or ask once, without writing them to disk."""
+    username = (os.environ.get("UCAS_USERNAME") or "").strip() if from_env else ""
+    password = (os.environ.get("UCAS_PASSWORD") or "") if from_env else ""
+    while not username:
         username = _ask("Mail")
         if not username:
             print("Mail is required.")
-            continue
+    while not password:
         password = _ask_password()
         if not password:
             print("Password is required.")
-            continue
+    return Session(username, password)
 
+
+def _login(client: UcasClient) -> Session:
+    """Prompt for the mail and password until the upstream accepts them.
+
+    Environment variables can supply credentials. Rejected credentials go
+    back to the prompts; transient errors retry the same ones.
+    """
+    session = _read_session()
+    while True:
         while True:
             print("Signing in... ", end="", flush=True)
             try:
-                client.login(username, password)
+                client.login(session.username, session.password)
             except UcasAuthError as exc:
                 print("failed.")
                 print(f"  {_error_hint(exc)}")
                 print()
+                session = _read_session(from_env=False)
                 break  # ask for the mail and password again
-            except UcasOperationalError as exc:
+            except UcasError as exc:
                 print("failed.")
                 print(f"  {_error_hint(exc)}")
                 print("  Retrying in a moment; press Ctrl+C to give up.")
@@ -191,7 +190,7 @@ def _login(client: UcasClient) -> Session:
                 time.sleep(2.0)
                 continue
             print("done.")
-            return Session(username=username, password=password)
+            return session
 
 
 # --------------------------------------------------------------------------- #
@@ -241,7 +240,7 @@ def _load_courses(client: UcasClient, session: Session, date: str) -> list[Cours
     print(f"Fetching courses for {_pretty_date(date)}... ", end="", flush=True)
     try:
         courses = client.query_courses(session.username, session.password, date)
-    except UcasOperationalError as exc:
+    except UcasError as exc:
         print("failed.")
         print(f"  {_error_hint(exc)}")
         return []
@@ -256,7 +255,12 @@ def _load_courses(client: UcasClient, session: Session, date: str) -> list[Cours
 
 
 def _report_sign(result: SignResult) -> bool:
-    """Print a successful sign-in (failures are raised, never returned)."""
+    """Report the outcome and leave failed attempts in the selection loop."""
+    if not result.success:
+        print("not signed.")
+        print(f"  ✗ {result.message}")
+        print("  You can select another course, or type auto to retry automatically.")
+        return False
     print("done.")
     detail = f" (sign-in record {result.stu_sign_id})" if result.stu_sign_id else ""
     print(f"  ✓ {result.message}{detail}")
@@ -271,7 +275,7 @@ def _sign(client: UcasClient, session: Session, identifier: str, label: str) -> 
     print(f"Signing in for {label}... ", end="", flush=True)
     try:
         result = client.sign(session.username, session.password, identifier)
-    except UcasOperationalError as exc:
+    except UcasError as exc:
         print("failed.")
         print(f"  ✗ {_error_hint(exc)}")
         return False
@@ -413,36 +417,60 @@ def _show_qr_refreshing(client: UcasClient, course: Course, label: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _course_loop(client: UcasClient, session: Session) -> None:
-    date = _today(client)
-    courses = _load_courses(client, session, date)
+def _run_auto(client: UcasClient, session: Session, minutes: int) -> None:
+    print(f"Automatic sign-in enabled: refresh every {minutes} minutes.")
+    print("Keep this terminal open and the computer awake. Ctrl+C stops automatic mode.")
+    configure_logging()
+    config = AutosignConfig(session.username, session.password, poll_minutes=minutes)
+    try:
+        Server(config, client).run_forever()
+    except KeyboardInterrupt:
+        print("\nAutomatic sign-in stopped.")
+
+
+def _course_loop(client: UcasClient, session: Session, minutes: int = 10) -> None:
+    courses: list[Course] = []
+    reload_courses = True
     _print_help()
-
     while True:
-        print()
-        command = _ask("Select")
-        if not command:
-            continue
-        lowered = command.lower()
+        try:
+            if reload_courses:
+                reload_courses = False
+                date = _today(client)
+                courses = _load_courses(client, session, date)
 
-        if lowered in ("q", "quit", "exit"):
-            raise _Quit
+            print()
+            command = _ask("Select")
+            if not command:
+                continue
+            lowered = command.lower()
+            if lowered in ("q", "quit", "exit"):
+                raise _Quit
+            if lowered in ("?", "help", "h"):
+                _print_help()
+                continue
+            if lowered in ("r", "reload", "refresh"):
+                reload_courses = True
+                continue
+            if lowered == "auto" or lowered.startswith("auto "):
+                parts = lowered.split()
+                try:
+                    interval = parse_poll_minutes(parts[1]) if len(parts) == 2 else minutes
+                    if len(parts) > 2:
+                        raise AutosignConfigError("usage: auto [10, 20, 30, ...]")
+                except AutosignConfigError as exc:
+                    print(f"  {exc}")
+                    continue
+                _run_auto(client, session, interval)
+                reload_courses = True
+                continue
 
-        if lowered in ("?", "help", "h"):
-            _print_help()
-            continue
-
-        if lowered in ("r", "reload", "refresh"):
-            date = _today(client)
-            courses = _load_courses(client, session, date)
-            continue
-
-        if lowered == "qr" or lowered.startswith("qr "):
-            argument = command[2:].strip()
-            if not argument:
+            is_qr = lowered == "qr" or lowered.startswith("qr ")
+            argument = command[2:].strip() if is_qr else command
+            if is_qr and not argument:
                 argument = _ask("Course number")
             if not argument.isdigit():
-                print("  Usage: qr <number>")
+                print(f"  Unrecognized input: {command!r}. Type ? for help.")
                 continue
             index = int(argument)
             if not 1 <= index <= len(courses):
@@ -451,50 +479,64 @@ def _course_loop(client: UcasClient, session: Session) -> None:
                 else:
                     print("  No courses loaded; use 'r' to reload.")
                 continue
-            _show_qr(client, courses[index - 1])
-            continue
-
-        if command.isdigit():
-            index = int(command)
-            if not 1 <= index <= len(courses):
-                if courses:
-                    print(f"  Enter a number between 1 and {len(courses)}.")
-                else:
-                    print("  No courses loaded; use 'r' to reload.")
-                continue
             course = courses[index - 1]
-            label = course.course_name or course.id
-            if _sign(client, session, course.id, f"'{label}'"):
-                date = _today(client)
-                courses = _load_courses(client, session, date)
-            continue
-
-        print(f"  Unrecognized input: {command!r}. Type ? for help.")
+            if is_qr:
+                _show_qr(client, course)
+                continue
+            if course.signed:
+                print("  This course is already signed in.")
+                continue
+            label = course.course_name or course.id or course.uuid
+            if _sign(client, session, course.id or course.uuid, f"'{label}'"):
+                reload_courses = True
+        except UcasError as exc:
+            # Recover from a rejected sign-in, unavailable clock, or malformed
+            # upstream response without losing the captured credentials.
+            print(f"  {_error_hint(exc)}")
+            print(
+                "  Credentials kept for this session. Select another course, r to reload, or auto."
+            )
 
 
 def main(argv: list[str] | None = None, *, client: UcasClient | None = None) -> int:
     """Program entry point."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    if any(arg in ("-h", "--help") for arg in args):
-        print(USAGE, end="")
-        return 0
-    if any(arg in ("-V", "--version") for arg in args):
-        print(f"ucas-course-sign-in {__version__}")
-        return 0
+    parser = argparse.ArgumentParser(
+        description="UCAS course sign-in",
+        epilog="Credentials: UCAS_USERNAME/UCAS_PASSWORD, or enter them once when prompted. "
+        "In the course menu, type auto to poll; Ctrl+C returns to the menu.",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"ucas-course-sign-in {__version__}"
+    )
+    parser.add_argument("--auto", action="store_true", help="refresh and sign in automatically")
+    parser.add_argument("--interval-minutes", default=None, help="10, 20, 30, ... minutes")
+    args = parser.parse_args(argv)
+    try:
+        minutes = parse_poll_minutes(
+            args.interval_minutes or os.environ.get("UCAS_POLL_MINUTES") or "10"
+        )
+    except AutosignConfigError as exc:
+        parser.error(str(exc))
 
     print("UCAS Course Sign-in")
     print("===================")
 
     active_client = client or UcasClient()
     try:
-        session = _login(active_client)
-        _course_loop(active_client, session)
+        if args.auto:
+            # Authentication happens inside each pass so an outage at startup
+            # does not prevent the next scheduled attempt.
+            session = _read_session()
+            _run_auto(active_client, session, minutes)
+        else:
+            session = _login(active_client)
+            _course_loop(active_client, session, minutes)
     except _Quit:
         print("\nBye.")
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130
-    except UcasOperationalError as exc:
+    except UcasError as exc:
         print(f"\nError: {_error_hint(exc)}")
         return 1
     finally:

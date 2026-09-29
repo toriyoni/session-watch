@@ -14,7 +14,7 @@ the original error-code semantics are kept.
 Error contract: see :mod:`common.error`. In short, operational failures raise
 :class:`~common.error.UcasOperationalError` subclasses, while response shapes
 nobody has written handling for raise :class:`UcasNotImplementedError`, which
-callers deliberately let crash.
+front ends report and retry at their command/pass boundaries.
 """
 
 from __future__ import annotations
@@ -248,7 +248,7 @@ def extract_clock_time(value: str) -> str:
 
     Raises:
         UcasNotImplementedError: the value has a shape we cannot parse (empty,
-            non-numeric or out-of-range) -- deliberately a crash, since it
+            non-numeric or out-of-range) -- reported by the front end, since it
             means the upstream changed its time format.
     """
     tokens = value.strip().split()
@@ -432,7 +432,7 @@ class UcasClient:
                 or an error ``STATUS``.
             UcasJsonError: the answer was not the expected JSON object.
             UcasNotImplementedError: the answer carries an unknown ``STATUS`` or
-                a ``result`` that is not a list -- crashes on purpose.
+                a ``result`` that is not a list.
         """
         normalized_date = normalize_date(date)
         login = self.login(username, password)
@@ -481,7 +481,7 @@ class UcasClient:
 
         ``identifier`` is either a 7-digit course schedule ID or a 32-character
         hex timetable UUID; the sign-in timestamp is the calibrated server
-        clock. Returns a :class:`SignResult` on success.
+        clock. Returns a :class:`SignResult` for either acceptance or rejection.
 
         Raises:
             UcasUnrecognizableCourse: ``identifier`` is neither a course ID nor
@@ -490,8 +490,7 @@ class UcasClient:
             UcasNetworkError: a request failed.
             UcasServerError: the sign-in endpoint answered with an HTTP error.
             UcasJsonError: the answer was not the expected JSON object.
-            UcasNotImplementedError: the answer shape has no handling yet --
-                crashes on purpose.
+            UcasNotImplementedError: clock calibration returned an unsupported shape.
         """
         course_id = normalize_course_sched_id(identifier)
         uuid = normalize_uuid(identifier)
@@ -534,7 +533,7 @@ class UcasClient:
             UcasNetworkError: the timestamp endpoint could not be reached.
             UcasJsonError: the reply body was not the expected JSON object.
             UcasNotImplementedError: the reply was missing a usable ``timestamp``
-                or carried a non-``0`` ``STATUS`` -- crashes on purpose.
+                or carried a non-``0`` ``STATUS``.
         """
         start_ms = time.time() * 1000
         response = self._request(
@@ -562,22 +561,32 @@ class UcasClient:
 def parse_sign_response(data: dict[str, Any]) -> SignResult:
     """Parse the upstream sign-in response, supporting both ``STATUS`` and ``ERRCODE`` styles.
 
-    Returns a :class:`SignResult` on success. The failure shapes have not been
-    pinned down yet, so anything else raises :class:`UcasNotImplementedError`
-    -- a deliberate crash, not a finished error path.
+    Rejections (including a closed sign-in window) are normal failed results.
+    Malformed replies raise a recoverable JSON error, never imply success.
     """
     result = data.get("result") or {}
     if not isinstance(result, dict):
         result = {}
 
-    upstream_status = str(data.get("STATUS") or data.get("ERRCODE") or "")
+    status = str(data["STATUS"]) if data.get("STATUS") is not None else ""
+    error_code = str(data["ERRCODE"]) if data.get("ERRCODE") is not None else ""
+    upstream_status = error_code if error_code not in ("", "0") else status or error_code
     stu_sign_id = str(result.get("stuSignId") or "")
     stu_sign_status = str(result.get("stuSignStatus") or "")
 
     if upstream_status == "0" and stu_sign_status == "1":
         return SignResult(True, "Sign-in successful", upstream_status, stu_sign_id, stu_sign_status)
 
-    raise UcasNotImplementedError(f"unhandled sign-in response: {str(data)[:200]}")
+    message = str(data.get("ERRMSG") or data.get("msg") or data.get("message") or "")
+    if upstream_status or message:
+        message = message or "Sign-in was not accepted; the sign-in window may not be open yet."
+        return SignResult(False, message, upstream_status, stu_sign_id, stu_sign_status)
+
+    raise UcasJsonError(
+        "Sign-in response has no recognizable status; please retry later",
+        "UPSTREAM_SIGN_BAD_JSON",
+        "sign",
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -1,24 +1,9 @@
-"""Exceptions raised by the UCAS client.
+"""Typed UCAS errors with a machine-readable code and request stage.
 
-Everything this package raises on purpose derives from :class:`UcasError`,
-which carries a machine-readable ``code`` and the ``stage`` (``request`` /
-``login`` / ``schedule`` / ``sign``) it happened in.
-
-Crash contract
---------------
-The hierarchy encodes how each front end may react:
-
-* The six *operational* errors (bad input, rejected credentials, network and
-  upstream trouble) derive from :class:`UcasOperationalError`. They are part of
-  normal operation: the automatic server catches them, logs them at
-  ``CRITICAL`` -- which the notify handler pushes -- and keeps running.
-* :class:`UcasNotImplementedError` deliberately derives from
-  :class:`UcasError` **only**. It marks a code path whose behaviour is not
-  pinned down yet, so it is never caught and crashes the process on purpose:
-  an unattended server must not limp along on an unimplemented path.
-
-So ``except UcasOperationalError`` is always safe, while
-``except UcasError`` also swallows the deliberate crashes -- avoid it.
+Front ends report UcasError subclasses at a command/pass boundary and keep
+running. UcasNotImplementedError distinguishes an unknown upstream shape from
+ordinary network/authentication failures so it remains visible in logs.
+Unexpected programming errors are not swallowed by these handlers.
 """
 
 from __future__ import annotations
@@ -79,10 +64,4 @@ class UcasUnrecognizableCourse(UcasOperationalError):
 
 
 class UcasNotImplementedError(UcasError):
-    """A code path that is deliberately not implemented yet.
-
-    Unlike every other :class:`UcasError` this one is *meant* to crash the
-    caller: it signals an upstream response shape nobody has written handling
-    for. Never catch it -- let it propagate, crash the process and show up in
-    the logs, so the missing path gets noticed and written.
-    """
+    """An unsupported upstream response; reported without ending the session."""

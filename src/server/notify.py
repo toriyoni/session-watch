@@ -32,9 +32,7 @@ FEISHU_MAX_BYTES = 30000
 class NotifyError(Exception):
     """Raised when the message cannot be delivered.
 
-    Notification delivery is best-effort but loud: nobody catches this error,
-    so a webhook that stops working takes the process down instead of letting
-    sign-in results vanish silently.
+    The logging handler reports this locally and lets polling continue.
     """
 
 
@@ -137,7 +135,7 @@ class FeishuNotifier(Notifier):
 
         Raises:
             NotifyError: the webhook answered with an error, or the HTTP
-                request itself failed. Callers deliberately let this crash.
+                request itself failed. The logging handler reports this without stopping polling.
         """
         try:
             response = self.client.post(
@@ -146,11 +144,16 @@ class FeishuNotifier(Notifier):
                 timeout=self._timeout,
             )
         except httpx.HTTPError as exc:
-            raise NotifyError(f"feishu: request failed: {exc}") from exc
+            raise NotifyError("feishu: request failed") from exc
         if response.status_code >= 400:
             raise NotifyError(f"feishu: upstream returned HTTP {response.status_code}")
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise NotifyError("feishu: response is not JSON") from exc
+        if not isinstance(data, dict):
+            raise NotifyError("feishu: response is not a JSON object")
         code = data.get("code")
         if code is None:
             code = data.get("StatusCode")
